@@ -1,0 +1,662 @@
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from pydantic import BaseModel, EmailStr
+from typing import List, Optional
+from datetime import date, datetime
+import os
+import shutil
+from pathlib import Path
+from passlib.context import CryptContext
+
+from database import create_tables, get_db
+from models import User, Booking, GalleryImage, UserDocument, CalendarEvent, Settings
+from config import settings
+
+# Initialize FastAPI
+app = FastAPI(
+    title="Unified Employee Agency API",
+    version="3.0.0",
+    description="Combined Customer Website + Admin Portal Backend"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static files
+os.makedirs("static/cv", exist_ok=True)
+os.makedirs("static/gallery", exist_ok=True)
+os.makedirs(settings.USER_DATA_PATH, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Create tables
+create_tables()
+
+# ==================== SCHEMAS ====================
+
+# User Schemas
+class UserRegisterCustomer(BaseModel):
+    email: EmailStr
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    nationality: Optional[str] = None
+    experience_years: Optional[int] = None
+    previous_roles: Optional[str] = None
+    skills: Optional[str] = None
+    preferred_country: Optional[str] = None
+    preferred_city: Optional[str] = None
+
+class UserCreateAdmin(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    license_type: Optional[str] = "basic"
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    experience_years: Optional[int] = None
+    previous_roles: Optional[str] = None
+    skills: Optional[str] = None
+    preferred_country: Optional[str] = None
+    preferred_city: Optional[str] = None
+    current_step: Optional[int] = None
+    registration_status: Optional[str] = None
+    license_active: Optional[bool] = None
+    license_type: Optional[str] = None
+    admin_notes: Optional[str] = None
+
+class UserResponse(BaseModel):
+    id: int
+    username: Optional[str] = None
+    email: str
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    license_active: bool
+    license_type: Optional[str] = None
+    current_step: Optional[int] = None
+    registration_status: Optional[str] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Booking Schemas
+class BookingCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+    purpose: Optional[str] = None
+    date: date
+    time: str
+    user_id: Optional[int] = None
+
+class BookingUpdate(BaseModel):
+    status: Optional[str] = None
+    admin_response: Optional[str] = None
+
+class BookingConfirm(BaseModel):
+    status: str
+    admin_response: Optional[str] = None
+    confirmed_by: str
+
+class BookingResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    phone: str
+    date: date
+    time: str
+    status: str
+    user_id: Optional[int] = None
+    admin_response: Optional[str] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Gallery Schema
+class GalleryResponse(BaseModel):
+    id: int
+    filename: str
+    filepath: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Settings Schema
+class SettingsUpdate(BaseModel):
+    value: dict
+
+# ==================== CUSTOMER ROUTES ====================
+
+@app.post("/api/customer/register/start", response_model=UserResponse)
+def customer_register_start(user: UserRegisterCustomer, db: Session = Depends(get_db)):
+    """Customer registration - Step 1"""
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    db_user = User(
+        username=user.email.split('@')[0],  # Generate username from email
+        email=user.email,
+        full_name=f"{user.first_name or ''} {user.last_name or ''}".strip(),
+        phone=user.phone,
+        date_of_birth=user.date_of_birth,
+        nationality=user.nationality,
+        current_step=1,
+        registration_status="in_progress",
+        license_active=False  # Not active until admin approves
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    # Create user folder
+    user_folder = Path(settings.USER_DATA_PATH) / f"user_{db_user.id}_{db_user.username}"
+    user_folder.mkdir(parents=True, exist_ok=True)
+    db_user.user_folder = str(user_folder)
+    db.commit()
+    db.refresh(db_user)
+    
+    return db_user
+
+@app.put("/api/customer/register/update/{id}", response_model=UserResponse)
+def customer_register_update(id: int, user: UserUpdate, db: Session = Depends(get_db)):
+    """Customer registration - Update steps"""
+    db_user = db.query(User).filter(User.id == id).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    
+    for key, value in user.model_dump(exclude_unset=True).items():
+        setattr(db_user, key, value)
+    
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.post("/api/customer/register/upload-cv/{id}")
+async def customer_upload_cv(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Customer upload CV"""
+    db_user = db.query(User).filter(User.id == id).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    
+    file_path = f"static/cv/{id}_{file.filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    db_user.cv_filename = file.filename
+    db_user.cv_path = file_path
+    db_user.current_step = 5
+    db_user.registration_status = "submitted"
+    db.commit()
+    
+    return {"message": "CV uploaded successfully", "filename": file.filename}
+
+@app.post("/api/customer/booking/create", response_model=BookingResponse)
+def customer_create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
+    """Customer create booking"""
+    db_booking = Booking(**booking.model_dump())
+    db.add(db_booking)
+    db.commit()
+    db.refresh(db_booking)
+    
+    # Create calendar event
+    event = CalendarEvent(
+        title=f"Interview: {booking.name}",
+        description=f"Purpose: {booking.purpose}",
+        event_type="booking",
+        event_date=booking.date,
+        event_time=booking.time,
+        reference_id=db_booking.id,
+        reference_type="booking"
+    )
+    db.add(event)
+    db.commit()
+    
+    return db_booking
+
+@app.get("/api/customer/gallery", response_model=List[GalleryResponse])
+def customer_get_gallery(db: Session = Depends(get_db)):
+    """Get all gallery images"""
+    return db.query(GalleryImage).all()
+
+@app.get("/api/customer/settings/homepage")
+def customer_get_homepage(db: Session = Depends(get_db)):
+    """Get homepage content"""
+    setting = db.query(Settings).filter(Settings.key == "homepage_content").first()
+    if not setting:
+        default = {
+            "hero_title": "Your Gateway to European Employment",
+            "hero_subtitle": "Connecting talented professionals with opportunities across EU",
+            "about_text": "We specialize in placing skilled workers in positions throughout Europe.",
+            "countries": ["Germany", "France", "Netherlands", "Belgium", "Austria"]
+        }
+        setting = Settings(key="homepage_content", value=default)
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return setting
+
+@app.get("/api/customer/settings/time-slots")
+def customer_get_time_slots(db: Session = Depends(get_db)):
+    """Get available time slots"""
+    setting = db.query(Settings).filter(Settings.key == "time_slots").first()
+    if not setting:
+        default = {"slots": ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"]}
+        setting = Settings(key="time_slots", value=default)
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return setting
+
+# ==================== ADMIN ROUTES ====================
+
+# Users Management
+@app.post("/api/admin/users", response_model=UserResponse)
+def admin_create_user(user: UserCreateAdmin, db: Session = Depends(get_db)):
+    """Admin create user"""
+    existing = db.query(User).filter(
+        (User.username == user.username) | (User.email == user.email)
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+    
+    hashed_password = pwd_context.hash(user.password)
+    db_user = User(
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        phone=user.phone,
+        license_type=user.license_type,
+        hashed_password=hashed_password,
+        license_active=True
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    # Create user folder
+    user_folder = Path(settings.USER_DATA_PATH) / f"user_{db_user.id}_{db_user.username}"
+    user_folder.mkdir(parents=True, exist_ok=True)
+    db_user.user_folder = str(user_folder)
+    db.commit()
+    db.refresh(db_user)
+    
+    return db_user
+
+@app.get("/api/admin/users", response_model=List[UserResponse])
+def admin_get_users(db: Session = Depends(get_db)):
+    """Admin get all users"""
+    return db.query(User).all()
+
+@app.get("/api/admin/users/{user_id}", response_model=UserResponse)
+def admin_get_user(user_id: int, db: Session = Depends(get_db)):
+    """Admin get user details"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+@app.put("/api/admin/users/{user_id}", response_model=UserResponse)
+def admin_update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get_db)):
+    """Admin update user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    for key, value in user_update.model_dump(exclude_unset=True).items():
+        setattr(user, key, value)
+    
+    db.commit()
+    db.refresh(user)
+    return user
+
+@app.post("/api/admin/users/{user_id}/toggle-license", response_model=UserResponse)
+def admin_toggle_license(user_id: int, license_data: dict, db: Session = Depends(get_db)):
+    """Admin toggle user license"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user.license_active = license_data.get("license_active", True)
+    db.commit()
+    db.refresh(user)
+    return user
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, db: Session = Depends(get_db)):
+    """Admin delete user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    db.delete(user)
+    db.commit()
+    return {"message": "User deleted successfully"}
+
+# Bookings Management
+@app.get("/api/admin/bookings", response_model=List[BookingResponse])
+def admin_get_bookings(status: str = None, user_id: int = None, db: Session = Depends(get_db)):
+    """Admin get all bookings"""
+    query = db.query(Booking)
+    if status:
+        query = query.filter(Booking.status == status)
+    if user_id:
+        query = query.filter(Booking.user_id == user_id)
+    return query.order_by(Booking.date.desc()).all()
+
+@app.get("/api/admin/bookings/pending", response_model=List[BookingResponse])
+def admin_get_pending_bookings(db: Session = Depends(get_db)):
+    """Admin get pending bookings"""
+    return db.query(Booking).filter(Booking.status == "pending").all()
+
+@app.post("/api/admin/bookings/{booking_id}/confirm", response_model=BookingResponse)
+def admin_confirm_booking(booking_id: int, confirm: BookingConfirm, db: Session = Depends(get_db)):
+    """Admin confirm/reject booking"""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    booking.status = confirm.status
+    booking.admin_response = confirm.admin_response
+    booking.confirmed_by = confirm.confirmed_by
+    booking.confirmed_at = datetime.now()
+    booking.notification_sent = True
+    db.commit()
+    db.refresh(booking)
+    return booking
+
+@app.put("/api/admin/bookings/{booking_id}", response_model=BookingResponse)
+def admin_update_booking(booking_id: int, booking_update: BookingUpdate, db: Session = Depends(get_db)):
+    """Admin update booking"""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    for key, value in booking_update.model_dump(exclude_unset=True).items():
+        setattr(booking, key, value)
+    
+    db.commit()
+    db.refresh(booking)
+    return booking
+
+@app.delete("/api/admin/bookings/{booking_id}")
+def admin_delete_booking(booking_id: int, db: Session = Depends(get_db)):
+    """Admin delete booking"""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    db.delete(booking)
+    db.commit()
+    return {"message": "Booking deleted successfully"}
+
+# Gallery Management
+@app.post("/api/admin/gallery/upload", response_model=GalleryResponse)
+async def admin_upload_gallery(
+    file: UploadFile = File(...),
+    title: str = None,
+    description: str = None,
+    db: Session = Depends(get_db)
+):
+    """Admin upload gallery image"""
+    file_path = f"static/gallery/{file.filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    db_image = GalleryImage(
+        filename=file.filename,
+        filepath=file_path,
+        title=title,
+        description=description
+    )
+    db.add(db_image)
+    db.commit()
+    db.refresh(db_image)
+    return db_image
+
+@app.delete("/api/admin/gallery/{image_id}")
+def admin_delete_gallery(image_id: int, db: Session = Depends(get_db)):
+    """Admin delete gallery image"""
+    image = db.query(GalleryImage).filter(GalleryImage.id == image_id).first()
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    if os.path.exists(image.filepath):
+        os.remove(image.filepath)
+    
+    db.delete(image)
+    db.commit()
+    return {"message": "Image deleted successfully"}
+
+# Settings Management
+@app.put("/api/admin/settings/homepage", response_model=dict)
+def admin_update_homepage(update: SettingsUpdate, db: Session = Depends(get_db)):
+    """Admin update homepage content"""
+    setting = db.query(Settings).filter(Settings.key == "homepage_content").first()
+    if not setting:
+        setting = Settings(key="homepage_content", value=update.value)
+        db.add(setting)
+    else:
+        setting.value = update.value
+    db.commit()
+    db.refresh(setting)
+    return {"message": "Homepage updated", "value": setting.value}
+
+@app.put("/api/admin/settings/time-slots", response_model=dict)
+def admin_update_time_slots(update: SettingsUpdate, db: Session = Depends(get_db)):
+    """Admin update time slots"""
+    setting = db.query(Settings).filter(Settings.key == "time_slots").first()
+    if not setting:
+        setting = Settings(key="time_slots", value=update.value)
+        db.add(setting)
+    else:
+        setting.value = update.value
+    db.commit()
+    db.refresh(setting)
+    return {"message": "Time slots updated", "value": setting.value}
+
+# Calendar
+@app.get("/api/admin/calendar/today")
+def admin_calendar_today(db: Session = Depends(get_db)):
+    """Get today's calendar events"""
+    today = date.today()
+    events = db.query(CalendarEvent).filter(
+        CalendarEvent.event_date == today,
+        CalendarEvent.status == "active"
+    ).all()
+    return events
+
+@app.get("/api/admin/calendar/upcoming")
+def admin_calendar_upcoming(days: int = 7, db: Session = Depends(get_db)):
+    """Get upcoming calendar events"""
+    from datetime import timedelta
+    today = date.today()
+    future_date = today + timedelta(days=days)
+    
+    events = db.query(CalendarEvent).filter(
+        CalendarEvent.event_date >= today,
+        CalendarEvent.event_date <= future_date,
+        CalendarEvent.status == "active"
+    ).order_by(CalendarEvent.event_date).all()
+    return events
+
+@app.get("/api/admin/calendar/notifications/pending")
+def admin_calendar_pending(db: Session = Depends(get_db)):
+    """Get pending booking notifications"""
+    bookings = db.query(Booking).filter(
+        Booking.status == "pending",
+        Booking.notification_sent == False
+    ).all()
+    return {"count": len(bookings), "bookings": bookings}
+
+# Dashboard
+@app.get("/api/admin/dashboard/stats")
+def admin_dashboard_stats(db: Session = Depends(get_db)):
+    """Admin dashboard statistics"""
+    total_users = db.query(User).count()
+    active_users = db.query(User).filter(User.license_active == True).count()
+    inactive_users = total_users - active_users
+    
+    total_bookings = db.query(Booking).count()
+    pending_bookings = db.query(Booking).filter(Booking.status == "pending").count()
+    confirmed_bookings = db.query(Booking).filter(Booking.status == "confirmed").count()
+    completed_bookings = db.query(Booking).filter(Booking.status == "completed").count()
+    
+    total_documents = db.query(UserDocument).count()
+    
+    return {
+        "users": {
+            "total": total_users,
+            "active": active_users,
+            "inactive": inactive_users
+        },
+        "bookings": {
+            "total": total_bookings,
+            "pending": pending_bookings,
+            "confirmed": confirmed_bookings,
+            "completed": completed_bookings
+        },
+        "documents": {
+            "total": total_documents
+        }
+    }
+
+@app.get("/api/admin/dashboard/recent-activity")
+def admin_recent_activity(limit: int = 10, db: Session = Depends(get_db)):
+    """Get recent activity"""
+    recent_bookings = db.query(Booking).order_by(Booking.created_at.desc()).limit(limit).all()
+    recent_users = db.query(User).order_by(User.created_at.desc()).limit(limit).all()
+    
+    return {
+        "recent_bookings": recent_bookings,
+        "recent_users": recent_users
+    }
+
+# Documents
+@app.post("/api/admin/documents/upload/{user_id}")
+async def admin_upload_document(
+    user_id: int,
+    file: UploadFile = File(...),
+    category: str = None,
+    description: str = None,
+    store_in_db: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Admin upload document for user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Save to user folder
+    user_folder = Path(user.user_folder) if user.user_folder else Path(settings.USER_DATA_PATH) / f"user_{user_id}_{user.username}"
+    user_folder.mkdir(parents=True, exist_ok=True)
+    
+    file_path = user_folder / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    file_data = None
+    if store_in_db:
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+    
+    document = UserDocument(
+        user_id=user_id,
+        filename=file.filename,
+        original_filename=file.filename,
+        file_type=file.content_type,
+        file_size=file_path.stat().st_size,
+        file_path=str(file_path),
+        file_data=file_data,
+        category=category,
+        description=description
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+    
+    return document
+
+@app.get("/api/admin/documents/user/{user_id}")
+def admin_get_user_documents(user_id: int, db: Session = Depends(get_db)):
+    """Get user documents"""
+    return db.query(UserDocument).filter(UserDocument.user_id == user_id).all()
+
+@app.get("/api/admin/documents/{document_id}/download")
+def admin_download_document(document_id: int, db: Session = Depends(get_db)):
+    """Download document"""
+    document = db.query(UserDocument).filter(UserDocument.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    if document.file_data:
+        return Response(
+            content=document.file_data,
+            media_type=document.file_type or "application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename={document.filename}"}
+        )
+    
+    if document.file_path and os.path.exists(document.file_path):
+        with open(document.file_path, "rb") as f:
+            file_data = f.read()
+        return Response(
+            content=file_data,
+            media_type=document.file_type or "application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename={document.filename}"}
+        )
+    
+    raise HTTPException(status_code=404, detail="File not found")
+
+# ==================== ROOT ====================
+
+@app.get("/")
+def root():
+    return {
+        "message": "Unified Employee Agency API v3.0",
+        "description": "Combined Customer Website + Admin Portal",
+        "features": [
+            "Customer Registration & Booking",
+            "Admin User Management",
+            "License Control System",
+            "Calendar & Notifications",
+            "Document Management",
+            "Gallery Management",
+            "Dashboard Analytics"
+        ],
+        "endpoints": {
+            "customer": "/api/customer/*",
+            "admin": "/api/admin/*",
+            "docs": "/docs"
+        }
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "version": "3.0.0"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
