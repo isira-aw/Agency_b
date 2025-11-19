@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,6 +12,9 @@ import os
 import shutil
 from pathlib import Path
 from passlib.context import CryptContext
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+from models import UserDocument
 
 from database import create_tables, get_db
 from models import User, Booking, GalleryImage, UserDocument, Settings
@@ -148,6 +152,19 @@ class GalleryResponse(BaseModel):
 class SettingsUpdate(BaseModel):
     value: dict
 
+class DocumentOut(BaseModel):
+    id: int
+    user_id: int
+    filename: str
+    category: str | None = None
+    description: str | None = None
+    uploaded_at: datetime
+    download_url: str = ""  # Make it optional with default
+
+    class Config:
+        from_attributes = True
+
+
 # ==================== CUSTOMER ROUTES ====================
 
 @app.post("/api/customer/register/start", response_model=UserResponse)
@@ -197,17 +214,27 @@ def customer_register_update(id: int, user: UserUpdate, db: Session = Depends(ge
 
 @app.post("/api/customer/register/upload-cv/{id}")
 async def customer_upload_cv(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Customer upload CV"""
+    """Customer upload CV (store directly in DB, not in local storage)"""
+    
     db_user = db.query(User).filter(User.id == id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="Registration not found")
     
-    file_path = f"static/cv/{id}_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    db_user.cv_filename = file.filename
-    db_user.cv_path = file_path
+    file_bytes = await file.read()
+
+    document = UserDocument(
+        user_id=id,
+        filename=file.filename,
+        original_filename=file.filename,
+        file_type=file.content_type,
+        file_size=len(file_bytes),
+        file_path=None, 
+        file_data=file_bytes,   
+        category="cv",
+        description="User CV"
+    )
+
+    db.add(document)
     db_user.current_step = 5
     db_user.registration_status = "submitted"
     db.commit()
@@ -544,79 +571,82 @@ def admin_recent_activity(limit: int = 10, db: Session = Depends(get_db)):
     }
 
 # Documents
-@app.post("/api/admin/documents/upload/{user_id}")
+# Fix the list_user_documents endpoint
+@app.get("/api/admin/documents/user/{user_id}", response_model=List[DocumentOut])
+def list_user_documents(user_id: int, db: Session = Depends(get_db)):
+    docs = db.query(UserDocument).filter(UserDocument.user_id == user_id).all()
+    result = []
+    for d in docs:
+        download_url = f"/api/admin/documents/download/{d.id}"
+        # Convert to dict first, then add download_url
+        doc_dict = {
+            "id": d.id,
+            "user_id": d.user_id,
+            "filename": d.filename,
+            "category": d.category,
+            "description": d.description,
+            "uploaded_at": d.uploaded_at,
+            "download_url": download_url
+        }
+        result.append(DocumentOut(**doc_dict))
+    return result
+
+# Also fix the admin_upload_document endpoint
+@app.post("/api/admin/documents/upload/{user_id}", response_model=DocumentOut)
 async def admin_upload_document(
     user_id: int,
     file: UploadFile = File(...),
     category: str = None,
     description: str = None,
-    store_in_db: bool = True,
     db: Session = Depends(get_db)
 ):
-    """Admin upload document for user"""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Save to user folder
-    user_folder = Path(user.user_folder) if user.user_folder else Path(settings.USER_DATA_PATH) / f"user_{user_id}_{user.username}"
-    user_folder.mkdir(parents=True, exist_ok=True)
-    
-    file_path = user_folder / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    file_data = None
-    if store_in_db:
-        with open(file_path, "rb") as f:
-            file_data = f.read()
-    
+
+    file_bytes = await file.read()
+
     document = UserDocument(
         user_id=user_id,
         filename=file.filename,
         original_filename=file.filename,
         file_type=file.content_type,
-        file_size=file_path.stat().st_size,
-        file_path=str(file_path),
-        file_data=file_data,
+        file_size=len(file_bytes),
+        file_path=None,
+        file_data=file_bytes,
         category=category,
         description=description
     )
+
     db.add(document)
     db.commit()
     db.refresh(document)
-    
-    return document
 
-@app.get("/api/admin/documents/user/{user_id}")
-def admin_get_user_documents(user_id: int, db: Session = Depends(get_db)):
-    """Get user documents"""
-    return db.query(UserDocument).filter(UserDocument.user_id == user_id).all()
+    download_url = f"/api/admin/documents/download/{document.id}"
+    # Use dict instead of from_orm + copy
+    return DocumentOut(
+        id=document.id,
+        user_id=document.user_id,
+        filename=document.filename,
+        category=document.category,
+        description=document.description,
+        uploaded_at=document.uploaded_at,
+        download_url=download_url
+    )
+# Add this endpoint to serve images directly (for frontend display)
+@app.get("/api/admin/documents/view/{doc_id}")
+def view_document(doc_id: int, db: Session = Depends(get_db)):
+    doc = db.query(UserDocument).filter(UserDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    # Return file with inline disposition so it displays in browser
+    return StreamingResponse(
+        BytesIO(doc.file_data),
+        media_type=doc.file_type or "application/octet-stream",
+        headers={"Content-Disposition": f"inline; filename={doc.filename}"}
+    )
 
-@app.get("/api/admin/documents/{document_id}/download")
-def admin_download_document(document_id: int, db: Session = Depends(get_db)):
-    """Download document"""
-    document = db.query(UserDocument).filter(UserDocument.id == document_id).first()
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    if document.file_data:
-        return Response(
-            content=document.file_data,
-            media_type=document.file_type or "application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={document.filename}"}
-        )
-    
-    if document.file_path and os.path.exists(document.file_path):
-        with open(document.file_path, "rb") as f:
-            file_data = f.read()
-        return Response(
-            content=file_data,
-            media_type=document.file_type or "application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={document.filename}"}
-        )
-    
-    raise HTTPException(status_code=404, detail="File not found")
 
 # ==================== ROOT ====================
 
