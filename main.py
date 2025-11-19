@@ -13,7 +13,7 @@ from pathlib import Path
 from passlib.context import CryptContext
 
 from database import create_tables, get_db
-from models import User, Booking, GalleryImage, UserDocument, CalendarEvent, Settings
+from models import User, Booking, GalleryImage, UserDocument, Settings
 from config import settings
 
 # Initialize FastAPI
@@ -216,26 +216,14 @@ async def customer_upload_cv(id: int, file: UploadFile = File(...), db: Session 
 
 @app.post("/api/customer/booking/create", response_model=BookingResponse)
 def customer_create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
-    """Customer create booking"""
     db_booking = Booking(**booking.model_dump())
+    
     db.add(db_booking)
     db.commit()
     db.refresh(db_booking)
-    
-    # Create calendar event
-    event = CalendarEvent(
-        title=f"Interview: {booking.name}",
-        description=f"Purpose: {booking.purpose}",
-        event_type="booking",
-        event_date=booking.date,
-        event_time=booking.time,
-        reference_id=db_booking.id,
-        reference_type="booking"
-    )
-    db.add(event)
-    db.commit()
-    
+
     return db_booking
+
 
 @app.get("/api/customer/gallery", response_model=List[GalleryResponse])
 def customer_get_gallery(db: Session = Depends(get_db)):
@@ -483,9 +471,9 @@ def admin_update_time_slots(update: SettingsUpdate, db: Session = Depends(get_db
 def admin_calendar_today(db: Session = Depends(get_db)):
     """Get today's calendar events"""
     today = date.today()
-    events = db.query(CalendarEvent).filter(
-        CalendarEvent.event_date == today,
-        CalendarEvent.status == "active"
+    events = db.query(Booking).filter(
+        Booking.date == today,
+        Booking.status == "confirmed"
     ).all()
     return events
 
@@ -496,11 +484,11 @@ def admin_calendar_upcoming(days: int = 7, db: Session = Depends(get_db)):
     today = date.today()
     future_date = today + timedelta(days=days)
     
-    events = db.query(CalendarEvent).filter(
-        CalendarEvent.event_date >= today,
-        CalendarEvent.event_date <= future_date,
-        CalendarEvent.status == "active"
-    ).order_by(CalendarEvent.event_date).all()
+    events = db.query(Booking).filter(
+        Booking.date >= today,
+        Booking.date <= future_date,
+        Booking.status == "confirmed"
+    ).order_by(Booking.date).all()
     return events
 
 @app.get("/api/admin/calendar/notifications/pending")
@@ -562,7 +550,7 @@ async def admin_upload_document(
     file: UploadFile = File(...),
     category: str = None,
     description: str = None,
-    store_in_db: bool = False,
+    store_in_db: bool = True,
     db: Session = Depends(get_db)
 ):
     """Admin upload document for user"""
