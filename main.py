@@ -571,7 +571,6 @@ def admin_recent_activity(limit: int = 10, db: Session = Depends(get_db)):
     }
 
 # Documents
-# Fix the list_user_documents endpoint
 @app.get("/api/admin/documents/user/{user_id}", response_model=List[DocumentOut])
 def list_user_documents(user_id: int, db: Session = Depends(get_db)):
     docs = db.query(UserDocument).filter(UserDocument.user_id == user_id).all()
@@ -623,7 +622,6 @@ async def admin_upload_document(
     db.refresh(document)
 
     download_url = f"/api/admin/documents/download/{document.id}"
-    # Use dict instead of from_orm + copy
     return DocumentOut(
         id=document.id,
         user_id=document.user_id,
@@ -640,7 +638,6 @@ def view_document(doc_id: int, db: Session = Depends(get_db)):
     if not doc:
         raise HTTPException(404, "Document not found")
     
-    # Return file with inline disposition so it displays in browser
     return StreamingResponse(
         BytesIO(doc.file_data),
         media_type=doc.file_type or "application/octet-stream",
