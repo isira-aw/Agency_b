@@ -241,6 +241,34 @@ async def customer_upload_cv(id: int, file: UploadFile = File(...), db: Session 
     
     return {"message": "CV uploaded successfully", "filename": file.filename}
 
+@app.post("/api/customer/register/payment/{id}")
+async def customer_upload_payment(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    
+    db_user = db.query(User).filter(User.id == id).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    
+    file_bytes = await file.read()
+
+    document = UserDocument(
+        user_id=id,
+        filename=file.filename,
+        original_filename=file.filename,
+        file_type=file.content_type,
+        file_size=len(file_bytes),
+        file_path=None, 
+        file_data=file_bytes,   
+        category="payment",
+        description="User Payment"
+    )
+
+    db.add(document)
+    db_user.current_step = 5
+    db_user.registration_status = "submitted"
+    db.commit()
+    
+    return {"message": "payment uploaded successfully", "filename": file.filename}
+
 @app.post("/api/customer/booking/create", response_model=BookingResponse)
 def customer_create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     db_booking = Booking(**booking.model_dump())
