@@ -44,7 +44,11 @@ os.makedirs(settings.USER_DATA_PATH, exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["argon2"],
+    deprecated="auto"
+)
+
 
 # Create tables
 create_tables()
@@ -673,7 +677,319 @@ def view_document(doc_id: int, db: Session = Depends(get_db)):
     )
 
 
-# ==================== ROOT ====================
+# ==================== user profile ====================
+
+
+# Add these imports at the top (if not already present)
+from datetime import timedelta
+from jose import JWTError, jwt
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+
+# Add these configurations after pwd_context
+SECRET_KEY = "your-secret-key-change-this-in-production"  # Change this!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/customer/login")
+
+# Add these new schemas after existing schemas
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+class CustomerLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    nationality: Optional[str] = None
+    experience_years: Optional[int] = None
+    previous_roles: Optional[str] = None
+    skills: Optional[str] = None
+    preferred_country: Optional[str] = None
+    preferred_city: Optional[str] = None
+
+class PasswordUpdate(BaseModel):
+    old_password: str
+    new_password: str
+
+# Add helper functions
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        token_data = TokenData(email=email)
+    except JWTError:
+        raise credentials_exception
+    
+    user = db.query(User).filter(User.email == token_data.email).first()
+    if user is None:
+        raise credentials_exception
+    
+    # Check if user is active
+    if not user.license_active:
+        raise HTTPException(status_code=403, detail="Your account is not active. Please contact administrator.")
+    
+    return user
+
+# ==================== NEW CUSTOMER AUTH & PROFILE ROUTES ====================
+
+@app.post("/api/customer/login", response_model=Token)
+async def customer_login(form_data: CustomerLogin, db: Session = Depends(get_db)):
+    """Customer login endpoint"""
+    user = db.query(User).filter(User.email == form_data.email).first()
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    if not user.hashed_password:
+        raise HTTPException(
+            status_code=401, 
+            detail="No password set. Please contact administrator to set up your password."
+        )
+    
+    if not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    # Check if account is active
+    if not user.license_active:
+        raise HTTPException(
+            status_code=403, 
+            detail="Your account is not active. Please contact administrator."
+        )
+    
+    # Update last login
+    user.last_login = datetime.now()
+    db.commit()
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user
+    }
+
+@app.get("/api/customer/profile/me", response_model=UserResponse)
+async def get_customer_profile(current_user: User = Depends(get_current_user)):
+    """Get current user profile"""
+    return current_user
+
+@app.put("/api/customer/profile/me", response_model=UserResponse)
+async def update_customer_profile(
+    profile_update: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update customer profile"""
+    for key, value in profile_update.model_dump(exclude_unset=True).items():
+        setattr(current_user, key, value)
+    
+    current_user.updated_at = datetime.now()
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+@app.post("/api/customer/profile/change-password")
+async def change_customer_password(
+    password_update: PasswordUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Change customer password"""
+    if not current_user.hashed_password:
+        raise HTTPException(status_code=400, detail="No password set. Contact administrator.")
+    
+    if not verify_password(password_update.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+    
+    current_user.hashed_password = get_password_hash(password_update.new_password)
+    db.commit()
+    
+    return {"message": "Password changed successfully"}
+
+@app.get("/api/customer/profile/documents", response_model=List[DocumentOut])
+async def get_customer_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all documents for current user"""
+    docs = db.query(UserDocument).filter(UserDocument.user_id == current_user.id).all()
+    result = []
+    for d in docs:
+        download_url = f"/api/customer/profile/documents/download/{d.id}"
+        doc_dict = {
+            "id": d.id,
+            "user_id": d.user_id,
+            "filename": d.filename,
+            "category": d.category,
+            "description": d.description,
+            "uploaded_at": d.uploaded_at,
+            "download_url": download_url
+        }
+        result.append(DocumentOut(**doc_dict))
+    return result
+
+@app.post("/api/customer/profile/documents/upload", response_model=DocumentOut)
+async def upload_customer_document(
+    file: UploadFile = File(...),
+    category: str = None,
+    description: str = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Upload document for current user"""
+    file_bytes = await file.read()
+
+    document = UserDocument(
+        user_id=current_user.id,
+        filename=file.filename,
+        original_filename=file.filename,
+        file_type=file.content_type,
+        file_size=len(file_bytes),
+        file_path=None,
+        file_data=file_bytes,
+        category=category,
+        description=description
+    )
+
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    download_url = f"/api/customer/profile/documents/download/{document.id}"
+    return DocumentOut(
+        id=document.id,
+        user_id=document.user_id,
+        filename=document.filename,
+        category=document.category,
+        description=document.description,
+        uploaded_at=document.uploaded_at,
+        download_url=download_url
+    )
+
+@app.get("/api/customer/profile/documents/download/{doc_id}")
+async def download_customer_document(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download document (only own documents)"""
+    doc = db.query(UserDocument).filter(
+        UserDocument.id == doc_id,
+        UserDocument.user_id == current_user.id
+    ).first()
+    
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    return StreamingResponse(
+        BytesIO(doc.file_data),
+        media_type=doc.file_type or "application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={doc.filename}"}
+    )
+
+@app.delete("/api/customer/profile/documents/{doc_id}")
+async def delete_customer_document(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete own document"""
+    doc = db.query(UserDocument).filter(
+        UserDocument.id == doc_id,
+        UserDocument.user_id == current_user.id
+    ).first()
+    
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    db.delete(doc)
+    db.commit()
+    return {"message": "Document deleted successfully"}
+
+@app.get("/api/customer/profile/bookings", response_model=List[BookingResponse])
+async def get_customer_bookings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all bookings for current user"""
+    bookings = db.query(Booking).filter(Booking.email == current_user.email).order_by(Booking.date.desc()).all()
+    return bookings
+
+@app.get("/api/customer/profile/bookings/status/{status}", response_model=List[BookingResponse])
+async def get_customer_bookings_by_status(
+    status: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get bookings by status (pending, confirmed, rejected)"""
+    bookings = db.query(Booking).filter(
+        Booking.email == current_user.email,
+        Booking.status == status
+    ).order_by(Booking.date.desc()).all()
+    return bookings
+
+# ==================== ADMIN: Set User Password (New) ====================
+
+class SetPasswordRequest(BaseModel):
+    password: str
+
+@app.post("/api/admin/users/{user_id}/set-password")
+def admin_set_user_password(
+    user_id: int,
+    password_req: SetPasswordRequest,
+    db: Session = Depends(get_db)
+):
+    """Admin sets password for a user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user.hashed_password = get_password_hash(password_req.password)
+    db.commit()
+    
+    return {
+        "message": "Password set successfully",
+        "user_id": user_id,
+        "email": user.email
+    }
+
+# ==================== ====================
 
 @app.get("/")
 def root():
